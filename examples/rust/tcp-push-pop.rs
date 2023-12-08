@@ -14,6 +14,7 @@ use ::demikernel::{
     QDesc,
     QToken,
 };
+use std::time::Duration;
 use ::std::{
     env,
     net::SocketAddr,
@@ -44,7 +45,8 @@ use ::demikernel::perftools::profiler;
 // Constants
 //======================================================================================================================
 
-const BUFFER_SIZE: usize = 64;
+const BUFFER_SIZE: usize = 1024;
+const NUM_REQS: usize  = 10240000;
 const FILL_CHAR: u8 = 0x65;
 
 //======================================================================================================================
@@ -134,7 +136,7 @@ impl TcpServer {
     }
 
     pub fn run(&mut self, local: SocketAddr, fill_char: u8, buffer_size: usize) -> Result<()> {
-        let nbytes: usize = buffer_size * 1024;
+        let nbytes: usize = buffer_size * NUM_REQS;
 
         if let Err(e) = self.libos.bind(self.sockqd, local) {
             anyhow::bail!("bind failed: {:?}", e.cause)
@@ -190,7 +192,7 @@ impl TcpServer {
                 Ok(_) => self.sga = None,
                 Err(e) => anyhow::bail!("failed to release scatter-gather array: {:?}", e),
             }
-            println!("pop {:?}", i);
+            //println!("pop {:?}", i);
         }
 
         #[cfg(feature = "profiler")]
@@ -243,7 +245,7 @@ impl TcpClient {
     }
 
     pub fn run(&mut self, remote: SocketAddr, fill_char: u8, buffer_size: usize) -> Result<()> {
-        let nbytes: usize = buffer_size * 1024;
+        let nbytes: usize = buffer_size * NUM_REQS;
 
         let qt: QToken = match self.libos.connect(self.sockqd, remote) {
             Ok(qt) => qt,
@@ -258,6 +260,8 @@ impl TcpClient {
 
         // Issue n sends.
         let mut i: usize = 0;
+        let mut has_stalled_count: usize = 0;
+        let mut log_bytes: usize = 0;
         while i < nbytes {
             self.sga = match mksga(&mut self.libos, buffer_size, fill_char) {
                 Ok(sga) => Some(sga),
@@ -273,19 +277,59 @@ impl TcpClient {
                 Err(e) => anyhow::bail!("push failed: {:?}", e.cause),
             };
 
+            let buf_len = self.sga.expect("should be a valid sgarray").sga_segs[0].sgaseg_len as usize;
             match self.libos.wait(qt, None) {
-                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_PUSH => (),
-                Ok(_) => anyhow::bail!("unexpected result"),
+                Ok(qr) => {
+                    match qr.qr_opcode {
+                        demi_opcode_t::DEMI_OPC_PUSH => {
+                            i += buf_len;
+                            has_stalled_count = 0;
+                            log_bytes += buf_len;
+                            if log_bytes >= (buffer_size * 100000) {
+                                println!("push {:?}", i);
+                                log_bytes = 0;
+                            }
+                        }
+                        demi_opcode_t::DEMI_OPC_FAILED => {
+                            if qr.qr_ret != libc::EBUSY as i64{
+                                panic!("Unexpected error code");
+                            }
+                            //println!("Stalling");
+                            // wait by trying to receive...this is just a hack to kick the scheduler
+                            let sleep_time = Duration::from_micros(1 << has_stalled_count);
+                            let qt: QToken = match self.libos.pop(self.sockqd, None) {
+                                Ok(qt) => qt,
+                                Err(e) => panic!("pop failed: {:?}", e.cause),
+                            };
+                            match self.libos.wait(qt, Some(sleep_time)) {
+                                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_POP => { },
+                                Err(e) => {
+                                    if e.errno != libc::ETIMEDOUT {
+                                        panic!("operation failed: {:?}", e.cause);
+                                    }
+                                },
+                                _ => panic!("unexpected result"),
+                            };
+
+                            has_stalled_count += 1;
+
+                        }
+                        _ => anyhow::bail!("unexpected result"),
+                    }
+                    if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED {
+                    //println!("conn {:?}: failed on reqs_done: {:?}", conn_index, conn_ref.reqs_done);
+                    // wait by trying to receive...this is just a hack to kick the scheduler
+
+                    }
+                },
                 Err(e) => anyhow::bail!("operation failed: {:?}", e.cause),
             };
-            i += self.sga.expect("should be a valid sgarray").sga_segs[0].sgaseg_len as usize;
 
             match self.libos.sgafree(self.sga.expect("should be a valid sgarray")) {
                 Ok(_) => self.sga = None,
                 Err(e) => anyhow::bail!("failed to release scatter-gather array: {:?}", e),
             }
 
-            println!("push {:?}", i);
         }
 
         #[cfg(feature = "profiler")]
