@@ -181,18 +181,20 @@ clean: clean-examples clean-tests clean-libs
 #=======================================================================================================================
 
 export CONFIG_PATH ?= $(HOME)/config.yaml
-export MTU ?= 1500
-export MSS ?= 1500
+export MTU ?= 9100
+export MSS ?= 9000
+export USE_JUMBO ?= 1
 export PEER ?= server
 export TEST ?= udp-push-pop
 export TEST_INTEGRATION ?= tcp-test
-export TIMEOUT ?= 120
+export TIMEOUT ?= 600
 
 # Runs system tests.
 test-system: test-system-rust
 
 # Rust system tests.
 test-system-rust:
+	@echo "LD_LIBRARY_PATH: $(LD_LIBRARY_PATH)"
 	timeout $(TIMEOUT) $(BINDIR)/examples/rust/$(TEST).elf $(ARGS)
 
 # Runs unit tests.

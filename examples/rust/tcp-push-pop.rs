@@ -14,7 +14,7 @@ use ::demikernel::{
     QDesc,
     QToken,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use ::std::{
     env,
     net::SocketAddr,
@@ -45,9 +45,10 @@ use ::demikernel::perftools::profiler;
 // Constants
 //======================================================================================================================
 
-const BUFFER_SIZE: usize = 1024;
+const BUFFER_SIZE: usize = 8192;
 const NUM_REQS: usize  = 10240000;
 const FILL_CHAR: u8 = 0x65;
+const DROP: f64 = 0.2;
 
 //======================================================================================================================
 // mksga()
@@ -137,6 +138,8 @@ impl TcpServer {
 
     pub fn run(&mut self, local: SocketAddr, fill_char: u8, buffer_size: usize) -> Result<()> {
         let nbytes: usize = buffer_size * NUM_REQS;
+        let num_drop_reqs = (DROP * NUM_REQS as f64).floor() as usize;
+        let log_drop_bytes: usize = buffer_size * num_drop_reqs;
 
         if let Err(e) = self.libos.bind(self.sockqd, local) {
             anyhow::bail!("bind failed: {:?}", e.cause)
@@ -158,6 +161,12 @@ impl TcpServer {
             Err(e) => anyhow::bail!("operation failed: {:?}", e.cause),
             Ok(_) => anyhow::bail!("unexpected result"),
         };
+
+        let mut start: Option<Instant> = None;
+        let mut start_bytes: usize = 0;
+        let mut end: Option<Instant> = None;
+        let mut end_bytes: usize = 0;
+        let mut next_log_bytes = (buffer_size * 1000000) as usize;
 
         // Perform multiple ping-pong rounds.
         let mut i: usize = 0;
@@ -192,11 +201,37 @@ impl TcpServer {
                 Ok(_) => self.sga = None,
                 Err(e) => anyhow::bail!("failed to release scatter-gather array: {:?}", e),
             }
+
+            match start {
+                Some(_) => {},
+                None => {
+                    if i >= log_drop_bytes {
+                        println!("starting logging period at {:?} bytes", i);
+                        start_bytes = i;
+                        start = Some(Instant::now());
+                    }
+                }
+            }
+
+            match end {
+                Some(_) => {},
+                None => {
+                    if i >= (nbytes - log_drop_bytes) {
+                        end_bytes = i;
+                        end = Some(Instant::now());
+                        println!("Ending logging period at {:?} bytes", i); 
+                    }
+                }
+            }
             //println!("pop {:?}", i);
         }
 
         #[cfg(feature = "profiler")]
         profiler::write(&mut std::io::stdout(), None).expect("failed to write to stdout");
+        let runtime = end.unwrap().duration_since(start.unwrap());
+        let runtime_num = runtime.as_secs() as f64 + (runtime.subsec_nanos() as f64 * 1e-9);
+        let bytes_sent = end_bytes - start_bytes;
+        println!("Sent {:?} bytes over {:?} s", bytes_sent, runtime);
 
         // TODO: close socket when we get close working properly in catnip.
         Ok(())
@@ -285,8 +320,8 @@ impl TcpClient {
                             i += buf_len;
                             has_stalled_count = 0;
                             log_bytes += buf_len;
-                            if log_bytes >= (buffer_size * 100000) {
-                                println!("push {:?}", i);
+                            if log_bytes >= (buffer_size * 1000000) {
+                                //println!("push {:?}", i);
                                 log_bytes = 0;
                             }
                         }
