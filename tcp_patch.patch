@@ -1,0 +1,50 @@
+diff --git a/src/rust/inetstack/protocols/tcp/established/background/sender.rs b/src/rust/inetstack/protocols/tcp/established/background/sender.rs
+index 97fde869..ad5401a6 100644
+--- a/src/rust/inetstack/protocols/tcp/established/background/sender.rs
++++ b/src/rust/inetstack/protocols/tcp/established/background/sender.rs
+@@ -25,6 +25,7 @@ use ::std::{
+ pub async fn sender(cb: Rc<ControlBlock>) -> Result<!, Fail> {
+     'top: loop {
+         // First, check to see if there's any unsent data.
++        debug!("Background loop checking to send"); 
+         // TODO: Change this to just look at the unsent queue to see if it is empty or not.
+         let (unsent_seq, unsent_seq_changed) = cb.get_unsent_seq_no();
+         futures::pin_mut!(unsent_seq_changed);
+@@ -101,10 +102,11 @@ pub async fn sender(cb: Rc<ControlBlock>) -> Result<!, Fail> {
+         let next_buf_size: usize = cb.unsent_top_size().expect("no buffer in unsent queue");
+ 
+         let sent_data: u32 = (send_next - send_unacked).into();
+-        if win_sz <= (sent_data + next_buf_size as u32)
++        if win_sz <= (sent_data as u32)
+             || effective_cwnd <= sent_data
+             || (effective_cwnd - sent_data) <= cb.get_mss() as u32
+         {
++            debug!("Sleeping because of window");
+             futures::select_biased! {
+                 _ = send_unacked_changed => continue 'top,
+                 _ = send_next_changed => continue 'top,
+diff --git a/src/rust/inetstack/protocols/tcp/established/sender.rs b/src/rust/inetstack/protocols/tcp/established/sender.rs
+index f9991932..d37f7d23 100644
+--- a/src/rust/inetstack/protocols/tcp/established/sender.rs
++++ b/src/rust/inetstack/protocols/tcp/established/sender.rs
+@@ -345,19 +345,7 @@ impl Sender {
+     }
+ 
+     pub fn pop_one_unsent_byte(&self) -> Option<DemiBuffer> {
+-        let mut queue = self.unsent_queue.borrow_mut();
+-
+-        let buf = queue.front_mut()?;
+-        let mut cloned_buf = buf.clone();
+-        let buf_len: usize = buf.len();
+-
+-        // Pop one byte off the buf still in the queue and all but one of the bytes on our clone.
+-        buf.adjust(1).expect("'buf' should contain at least one byte");
+-        cloned_buf
+-            .trim(buf_len - 1)
+-            .expect("'cloned_buf' should contain at least one less than its professed length");
+-
+-        Some(cloned_buf)
++        self.pop_unsent(1)
+     }
+ 
+     pub fn pop_unsent(&self, max_bytes: usize) -> Option<DemiBuffer> {
