@@ -22,9 +22,11 @@ use ::demikernel::{
     QDesc,
     QToken,
 };
+use std::{fs::OpenOptions, sync::{atomic::{AtomicU64, Ordering}, Arc}, thread};
 #[cfg(target_os = "linux")]
 use ::std::mem;
 use ::std::{
+    io::Write,
     net::{
         Ipv4Addr,
         SocketAddr,
@@ -66,6 +68,7 @@ pub const SOCK_DGRAM: i32 = libc::SOCK_DGRAM;
 pub struct ProgramArguments {
     /// Local socket IPv4 address.
     local: SocketAddr,
+    output_file: String,
 }
 
 /// Associate functions for Program Arguments
@@ -86,12 +89,23 @@ impl ProgramArguments {
                     .value_name("ADDRESS:PORT")
                     .help("Sets local address"),
             )
+            .arg(
+                Arg::new("output_file")
+                    .long("output_file")
+                    .value_parser(clap::value_parser!(String))
+                    .required(true)
+                    .value_name("OUTPUT_FILE")
+                    .help("file results are written to")
+            )
             .get_matches();
 
         // Default arguments.
         let mut args: ProgramArguments = ProgramArguments {
             local: SocketAddr::from_str(Self::DEFAULT_LOCAL)?,
+            output_file: String::from(""),
         };
+
+        args.output_file = matches.get_one::<String>("output_file").unwrap().to_string();
 
         // Local address.
         if let Some(addr) = matches.get_one::<String>("local") {
@@ -99,6 +113,10 @@ impl ProgramArguments {
         }
 
         Ok(args)
+    }
+
+    pub fn get_output_file(&self) -> &String {
+        &self.output_file
     }
 
     /// Returns the local endpoint address parameter stored in the target program arguments.
@@ -123,6 +141,7 @@ struct Application {
     libos: LibOS,
     // Local socket descriptor.
     sockqd: QDesc,
+    output_file: String
 }
 
 /// Associated Functions for the Application
@@ -156,7 +175,30 @@ impl Application {
 
         println!("Local Address: {:?}", local);
 
-        Ok(Self { libos, sockqd })
+        Ok(Self { libos, sockqd, output_file: args.get_output_file().clone() })
+    }
+    
+    fn log_bw(output_file: String, log_period: f64, bytes_echoed: Arc<AtomicU64>) {
+        let mut file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(output_file)
+                        .expect("Couldn't open output file");
+
+        let start = Instant::now();
+
+        write!(file, "timestamp_us,bytes\n").expect("Couldn't write to output file");
+
+        loop {
+            let bytes_echoed = bytes_echoed.load(Ordering::Relaxed);
+            let time = start.elapsed();
+            let time_num = time.as_micros();
+
+            write!(file, "{},{}\n", time_num, bytes_echoed).expect("Couldn't write to output file");
+
+            thread::sleep(Duration::from_secs_f64(log_period));
+        }
     }
 
     /// Runs the target echo server.
@@ -165,6 +207,14 @@ impl Application {
         let start: Instant = Instant::now();
         let mut qtokens: Vec<QToken> = Vec::new();
         let mut last_log: Instant = Instant::now();
+        
+        let bytes_echoed = Arc::new(AtomicU64::new(0));
+        let thread_bytes_echoed = bytes_echoed.clone();
+        let output_filename = self.output_file.clone();
+        let log_handle = thread::spawn(move || {
+            Application::log_bw(output_filename, 1.0, thread_bytes_echoed);
+        });
+
 
         // Pop first packet.
         let qt: QToken = match self.libos.pop(self.sockqd, None) {
@@ -175,11 +225,6 @@ impl Application {
 
         loop {
             // Dump statistics.
-            if last_log.elapsed() > Duration::from_secs(Self::LOG_INTERVAL) {
-                let elapsed: Duration = Instant::now() - start;
-                println!("{:?} B / {:?} us", nbytes, elapsed.as_micros());
-                last_log = Instant::now();
-            }
 
             let (i, qr) = match self.libos.wait_any(&qtokens, None) {
                 Ok((i, qr)) => (i, qr),
@@ -206,6 +251,7 @@ impl Application {
                         },
                     };
                     nbytes += sga.sga_segs[0].sgaseg_len as usize;
+                    bytes_echoed.fetch_add(sga.sga_segs[0].sgaseg_len as u64, Ordering::Relaxed);
                     // Push packet back.
                     let qt: QToken = match self.libos.pushto(sockqd, &sga, saddr) {
                         Ok(qt) => qt,
